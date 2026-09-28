@@ -4,3 +4,7 @@ data/
 coverage/
 *.sqlite*
 test-results/
+
+dist/
+.sites-runtime/
+.wrangler/

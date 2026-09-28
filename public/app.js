@@ -1,5 +1,7 @@
 const app = document.querySelector("#app"),
   toast = document.querySelector("#toast");
+let hosted = false;
+let draftName = "";
 let state = null,
   csrf = "",
   page = "district",
@@ -62,6 +64,10 @@ async function api(path, data) {
   return result;
 }
 function accept(result) {
+  if (result.hosted) {
+    hosted = true;
+    authMode = "register";
+  }
   if (result.csrf) csrf = result.csrf;
   if (result.state && (!state || result.state.serverTime >= state.serverTime))
     state = result.state;
@@ -72,15 +78,25 @@ function title() {
 }
 function login() {
   app.innerHTML = `<main class="entry"><section class="entry-world">${title()}<div class="entry-copy"><span class="eyebrow"><span class="live-dot"></span> A PERSISTENT WORLD</span><h1>The world ended.<br><em>Your story didn’t.</em></h1><p>Explore the forgotten streets. Build a place to call home.<br>Make something of what remains.</p><div class="entry-skyline" aria-hidden="true">${Array.from({ length: 13 }, (_, i) => `<div class="tower t${i % 5}"><i></i><i></i><i></i></div>`).join("")}</div><div class="entry-caption"><span>QUARANTINE DISTRICT 01</span><span>51° 30′ N / 00° 07′ W · FICTIONAL SECTOR</span></div></div><footer>EXPLORE. ENDURE. REBUILD.<span>FOUNDATION BUILD 0.1</span></footer></section><section class="entry-form"><div><span class="eyebrow">THE REFUGE IS OPEN</span><h2>${authMode === "register" ? "A new beginning." : "Welcome back."}</h2><p class="subtle">${authMode === "register" ? "Create your survivor and enter the district." : "Your corner of the world is waiting."}</p><form id="auth-form"><label for="name">SURVIVOR NAME</label><input id="name" name="name" autocomplete="username" minlength="3" maxlength="20" pattern="[A-Za-z0-9_]+" placeholder="Your callsign" required><label for="password">PASSWORD</label><input id="password" name="password" type="password" autocomplete="${authMode === "register" ? "new-password" : "current-password"}" minlength="10" maxlength="128" placeholder="At least 10 characters" required><p class="form-error" role="alert">${esc(lastError)}</p><button class="primary full" ${busy ? "disabled" : ""}>${busy ? "Establishing contact…" : authMode === "register" ? "Enter the district" : "Return to the district"} ${icon("arrow")}</button></form><p class="auth-switch">${authMode === "register" ? "Already have a survivor?" : "New to the refuge?"} <button data-auth-toggle>${authMode === "register" ? "Sign in" : "Create a survivor"}</button></p><div class="entry-note">${icon("radio")}<p>One shared world. Your progress is saved on the server. Come back when you’re ready.</p></div></div></section></main>`;
-  document.querySelector("[data-auth-toggle]").onclick = () => {
-    authMode = authMode === "register" ? "login" : "register";
-    lastError = "";
-    login();
-  };
+  document.querySelector("#name").value = draftName;
+  if (hosted) {
+    document.querySelector('label[for="password"]').remove();
+    document.querySelector("#password").remove();
+    document.querySelector(".auth-switch").innerHTML =
+      "Signed in with ChatGPT. Choose a callsign for your survivor.";
+  }
+  const toggle = document.querySelector("[data-auth-toggle]");
+  if (toggle)
+    toggle.onclick = () => {
+      authMode = authMode === "register" ? "login" : "register";
+      lastError = "";
+      login();
+    };
   document.querySelector("#auth-form").onsubmit = async (event) => {
     event.preventDefault();
     if (busy) return;
     const form = new FormData(event.currentTarget);
+    draftName = String(form.get("name") || "");
     busy = true;
     const button = event.currentTarget.querySelector("button");
     button.disabled = true;
@@ -203,7 +219,11 @@ function render() {
     if (busy) return;
     busy = true;
     try {
-      await api("logout", {});
+      const result = await api("logout", {});
+      if (result.redirect === "/signout-with-chatgpt?return_to=/") {
+        window.location.assign(result.redirect);
+        return;
+      }
       state = null;
       csrf = "";
       authMode = "login";
@@ -266,7 +286,7 @@ async function refresh() {
 }
 try {
   accept(await api("state"));
-  selected = state.player.location;
+  if (state) selected = state.player.location;
 } catch (e) {
   if (e.status !== 401)
     lastError = "Unable to reach the world server. Please try again.";
@@ -275,3 +295,37 @@ render();
 setInterval(() => {
   if (state) refresh();
 }, 5000);
+
+// Optional structured inspection uses the same visible state; never exposes CSRF.
+if (document.modelContext?.registerTool) {
+  try {
+    Promise.resolve(
+      document.modelContext.registerTool({
+        name: "inspect_survivor",
+        description:
+          "Read the currently displayed survivor, location, and encounter without taking a game action.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+        annotations: { readOnlyHint: true, untrustedContentHint: true },
+        execute(input) {
+          if (
+            !input ||
+            typeof input !== "object" ||
+            Array.isArray(input) ||
+            Object.keys(input).length
+          )
+            throw new Error("No arguments expected.");
+          if (!state) throw new Error("Enter the district first.");
+          return {
+            player: { ...state.player },
+            location: { ...state.world[state.player.location] },
+            encounter: state.encounter ? { ...state.encounter } : null,
+          };
+        },
+      }),
+    ).catch(() => {});
+  } catch {}
+}

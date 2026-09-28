@@ -44,3 +44,13 @@ This API intentionally has no arbitrary player lookup, resource grant, client cl
 Use one application process and one local persistent SQLite database initially. Synchronous transactions make correctness straightforward for a small shared world, but are not a claim of MMO-scale capacity. The state endpoint has simple per-tile presence queries; optimize with aggregation and shared snapshots as the world grows. No distributed state, WebSockets, public chat, PvP, or autonomous faction simulation is claimed.
 
 Before scaling: introduce ordered schema migrations beyond version 1, PostgreSQL transactions as concurrency/load warrants, distributed command/rate-limit storage, migrations/backups/restore verification, observability, account recovery, and load tests. Preserve the server authority and command semantics through that transition. Separate public deployment approval from code review.
+
+## Hosted target
+
+`cloud/worker.js` runs the same UI and game rules without a local installation. Private Sites supplies verified ChatGPT identity; no passwords are collected by the hosted game. The first visit chooses a callsign, and the authenticated identity is the server-only owner key. All writes still check same-origin requests; gameplay additionally checks the survivor's CSRF token.
+
+D1 stores one versioned world snapshot for this small first district. `cloud/store.js` reads a revision, applies an operation to an isolated copy, and uses an atomic conditional UPDATE to commit only if the revision has not changed. Conflicts reload and revalidate, so different Workers cannot spend the same resources or award the same target twice. This is intentionally a small-world storage adapter, not an MMO-scale data model. Command receipts and journals are bounded. A future larger deployment should partition state with a deliberate transaction strategy.
+
+Drizzle-generated schema-only migrations own the hosted table. There is no runtime DDL. Hosted and local save files are separate stores; this initial deployment does not copy any development accounts. `scripts/hosted-check.mjs` tests the built Worker against a D1-compatible SQLite test adapter, including simultaneous requests and rule parity with the local engine. Real cloud deployment status verifies publication; it is not a substitute for future load testing.
+
+Optional WebMCP provides read-only inspection of visible game state. A supported WebMCP preview context was unavailable; it is feature-detected and does not affect normal play.

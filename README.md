@@ -6,7 +6,13 @@ A persistent multiplayer browser RPG inspired by **Torn, Travian, and Urban Dead
 
 ![Westbridge district interface](docs/screenshots/district.png)
 
-## Run locally
+## Hosted browser play
+
+The hosted version is private to the owner and uses ChatGPT sign-in. Choose a survivor callsign on the first visit; later visits resume the same survivor. Progress is stored in the hosted database, not the work PC. No clone, installation, or local server is needed to play the hosted version.
+
+The hosted adapter lives in `cloud/`. Run `npm run db:generate` for new schema changes, `npm run build` to produce the Worker, then `npm run test:hosted`. Hosting is managed through the Site identified in `.openai/hosting.json`.
+
+## Optional local development
 
 Install **Node.js 24 LTS**. There are no third-party application dependencies and no build step.
 
@@ -54,7 +60,7 @@ The smoke test runs its own isolated server and two browser sessions. Screenshot
 
 ## Hosting
 
-This is a real Node server, **not a static website**. GitHub Pages cannot run its backend. Start with one Node process and persistent local storage. Put it behind an HTTPS reverse proxy for remote play.
+There are two server targets. The original local target is Node + SQLite. The hosted target is a Worker + D1, with authenticated identity supplied by the private hosting gateway. Both keep game state on the server. GitHub Pages cannot run either backend. The variables below apply to the optional Node target.
 
 | Variable        | Default                  | Purpose                                                                        |
 | --------------- | ------------------------ | ------------------------------------------------------------------------------ |
