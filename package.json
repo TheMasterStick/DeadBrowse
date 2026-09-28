@@ -1,0 +1,26 @@
+{
+  "name": "deadbrowse",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A persistent multiplayer browser RPG foundation",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test",
+    "check": "node --check src/server.js && node --check src/game.js && node --check public/app.js && node --check scripts/browser-smoke.mjs",
+    "test:browser": "node scripts/browser-smoke.mjs",
+    "build": "node scripts/build-hosted.mjs",
+    "db:generate": "drizzle-kit generate",
+    "test:hosted": "node scripts/hosted-check.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1",
+    "drizzle-kit": "0.31.9",
+    "drizzle-orm": "0.45.2",
+    "esbuild": "0.27.3"
+  }
+}
