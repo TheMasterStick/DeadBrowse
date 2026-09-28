@@ -1,5 +1,6 @@
 import { transact, ConflictError } from "./store.js";
 import { register, snapshot, action, GameError } from "./game.js";
+import atlas from "../public/art/city-atlas.webp";
 import html from "../public/index.html";
 import javascript from "../public/app.js";
 import css from "../public/styles.css";
@@ -69,6 +70,14 @@ export default {
       if (!path.startsWith("/api/")) {
         if (!["GET", "HEAD"].includes(request.method))
           return json(405, { error: "Method not allowed." });
+        if (path === "/art/city-atlas.webp")
+          return new Response(request.method === "HEAD" ? null : atlas, {
+            headers: {
+              "Content-Type": "image/webp",
+              "Cache-Control": "public, max-age=86400",
+              "X-Content-Type-Options": "nosniff",
+            },
+          });
         const asset = {
           "/": [html, "text/html"],
           "/app.js": [javascript, "text/javascript"],

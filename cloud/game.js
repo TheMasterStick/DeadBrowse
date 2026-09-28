@@ -1,4 +1,14 @@
-import { WORLD, RULES, adjacent } from "../src/world.js";
+import {
+  WORLD,
+  RULES,
+  adjacent,
+  HOME,
+  CITY_SIZE,
+  localBlocks,
+  travelTime,
+  capacity,
+  migrateLocation,
+} from "../src/world.js";
 export class GameError extends Error {
   constructor(message, status = 400) {
     super(message);
@@ -12,7 +22,56 @@ function event(p, message, now) {
   p.events.unshift({ at: now, message });
   p.events = p.events.slice(0, 100);
 }
+export function upgradeWorld(w, now) {
+  if (w.schemaVersion === 2) return;
+  if (w.schemaVersion && w.schemaVersion > 2)
+    throw new GameError("This world requires a newer game version.", 503);
+  for (const p of Object.values(w.players)) {
+    p.location = migrateLocation(p.location);
+    p.travel = null;
+    p.version++;
+    event(
+      p,
+      "Westbridge has opened up. Your refuge and supplies are unchanged; the city now extends across 100 × 100 blocks.",
+      now,
+    );
+  }
+  for (const c of Object.values(w.encounters)) {
+    c.enemy_id = `walker-${migrateLocation(Number(c.enemy_id.slice(7)))}`;
+  }
+  w.enemies = Object.fromEntries(
+    Object.entries(w.enemies).map(([id, time]) => [
+      `walker-${migrateLocation(Number(id.slice(7)))}`,
+      time,
+    ]),
+  );
+  w.supplies = {};
+  w.schemaVersion = 2;
+}
+export function supply(w, id, now) {
+  const max = capacity(id),
+    stored = w.supplies[id];
+  if (!stored) return { remaining: max, capacity: max, nextRefillAt: null };
+  const ticks = Math.max(
+    0,
+    Math.floor((now - stored.at) / RULES.supplyRefillInterval),
+  );
+  if (ticks) {
+    stored.remaining = Math.min(max, stored.remaining + ticks);
+    stored.at += ticks * RULES.supplyRefillInterval;
+  }
+  if (stored.remaining === max) {
+    delete w.supplies[id];
+    return { remaining: max, capacity: max, nextRefillAt: null };
+  }
+  return {
+    remaining: stored.remaining,
+    capacity: max,
+    nextRefillAt: stored.at + RULES.supplyRefillInterval,
+  };
+}
 export function register(w, id, name, now) {
+  upgradeWorld(w, now);
   if (w.players[id]) return snapshot(w, id, now);
   check(
     typeof name === "string" && /^[A-Za-z0-9_]{3,20}$/.test(name),
@@ -28,7 +87,8 @@ export function register(w, id, name, now) {
   w.players[id] = {
     id,
     name,
-    location: 12,
+    location: HOME,
+    travel: null,
     hp: 100,
     energy: 100,
     energy_at: now,
@@ -52,6 +112,19 @@ export function register(w, id, name, now) {
   return snapshot(w, id, now);
 }
 function settle(w, id, now) {
+  upgradeWorld(w, now);
+  for (const traveller of Object.values(w.players))
+    if (traveller.travel && now >= traveller.travel.arrivesAt) {
+      const arrival = traveller.travel;
+      traveller.location = arrival.to;
+      traveller.travel = null;
+      traveller.version++;
+      event(
+        traveller,
+        `Arrived at ${WORLD[traveller.location].name}.`,
+        arrival.arrivesAt,
+      );
+    }
   const p = w.players[id];
   check(p, "Choose a survivor name to begin.", 401);
   for (const [owner, c] of Object.entries(w.encounters))
@@ -103,7 +176,7 @@ export function snapshot(w, id, now) {
     c = w.encounters[id] || null;
   const { csrf, events, commands, ...player } = p;
   const enemies =
-    p.location === 12
+    p.location === HOME || p.travel
       ? []
       : [enemy(w, p.location)].map((e) => {
           const other = Object.values(w.encounters).find(
@@ -117,13 +190,23 @@ export function snapshot(w, id, now) {
         });
   return {
     player,
-    world: WORLD.map((loc) => ({
+    city: { width: CITY_SIZE, height: CITY_SIZE, home: HOME },
+    location: WORLD[p.location],
+    travelDestination: p.travel ? WORLD[p.travel.to] : null,
+    world: localBlocks(p.location).map((loc) => ({
+      supply: supply(w, loc.id, now),
+      travelSeconds:
+        loc.id === p.location ? 0 : travelTime(p.location, loc.id) / 1000,
       ...loc,
-      players: Object.values(w.players).filter((p) => p.location === loc.id)
-        .length,
+      players: Object.values(w.players).filter(
+        (p) => !p.travel && p.location === loc.id,
+      ).length,
     })),
     occupants: Object.values(w.players)
-      .filter((o) => o.id !== id && o.location === p.location)
+      .filter(
+        (o) =>
+          !p.travel && !o.travel && o.id !== id && o.location === p.location,
+      )
       .map((o) => ({ id: o.id, name: o.name })),
     enemies,
     encounter: c,
@@ -148,6 +231,11 @@ export function action(w, id, input, now) {
     "Your survivor state changed. Try again.",
     409,
   );
+  check(
+    !p.travel || input.type === "heal",
+    "You are travelling. Wait until you arrive.",
+    409,
+  );
   const c = w.encounters[id];
   check(
     !c || ["strike", "guard", "flee", "heal"].includes(input.type),
@@ -163,14 +251,28 @@ export function action(w, id, input, now) {
         adjacent(p.location, input.target),
       "Choose an adjacent block.",
     );
-    p.location = input.target;
-    message = `Travelled to ${WORLD[p.location].name}.`;
+    p.travel = {
+      from: p.location,
+      to: input.target,
+      departedAt: now,
+      arrivesAt: now + travelTime(p.location, input.target),
+    };
+    message = `Departed for ${WORLD[input.target].name}. Travel time: ${travelTime(p.location, input.target) / 1000} seconds.`;
   } else if (input.type === "search") {
     check(
-      p.location !== 12,
+      p.location !== HOME,
       "The refuge supplies are managed at your workbench.",
     );
     check(now >= p.search_at, "You need a moment before searching again.", 409);
+    const stock = supply(w, p.location, now);
+    check(
+      stock.remaining > 0,
+      "This block has been picked clean. Try another block or wait for supplies to replenish.",
+      409,
+    );
+    if (!w.supplies[p.location])
+      w.supplies[p.location] = { remaining: stock.capacity, at: now };
+    w.supplies[p.location].remaining--;
     p.search_at = now + RULES.searchCooldown;
     if (WORLD[p.location].type === "medical") {
       p.medkits++;
@@ -183,7 +285,7 @@ export function action(w, id, input, now) {
     p.xp += 2;
   } else if (input.type === "attack") {
     check(
-      p.location !== 12 && input.target === `walker-${p.location}`,
+      p.location !== HOME && input.target === `walker-${p.location}`,
       "That target is not in your block.",
     );
     const e = enemy(w, p.location);
@@ -243,7 +345,10 @@ export function action(w, id, input, now) {
       message += " The enemy struck for 6 damage.";
     }
   } else if (input.type === "upgrade") {
-    check(p.location === 12, "Return to the refuge to upgrade your workbench.");
+    check(
+      p.location === HOME,
+      "Return to the refuge to upgrade your workbench.",
+    );
     check(p.level < 5, "Workbench is already at maximum level.");
     check(p.scrap >= p.level * 40, `You need ${p.level * 40} scrap.`);
     p.scrap -= p.level * 40;
@@ -253,7 +358,7 @@ export function action(w, id, input, now) {
   } else throw new GameError("Unknown action.");
   if (p.hp <= 0) {
     p.hp = 50;
-    p.location = 12;
+    p.location = HOME;
     delete w.encounters[id];
     if (c) w.enemies[c.enemy_id] = now + RULES.enemyRespawn;
     message +=

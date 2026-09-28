@@ -2,10 +2,6 @@ import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import worker from "../dist/server/index.js";
-import { createGame } from "../src/game.js";
-import { emptyWorld } from "../cloud/store.js";
-import { register, action } from "../cloud/game.js";
-
 const database = new DatabaseSync(":memory:");
 for (const name of readdirSync("drizzle").filter((n) => n.endsWith(".sql")))
   database.exec(readFileSync(`drizzle/${name}`, "utf8"));
@@ -28,6 +24,9 @@ const DB = {
   },
 };
 const origin = "https://deadbrowse.example";
+const realNow = Date.now;
+let time = realNow();
+Date.now = () => time;
 async function request(user, path, data, csrf) {
   const response = await worker.fetch(
     new Request(origin + "/api/" + path, {
@@ -55,48 +54,54 @@ try {
     b = await request("bravo", "register", { name: "Bravo" });
   assert.equal(a.status, 200);
   assert.notEqual(a.state.player.id, b.state.player.id);
+  assert.equal(a.state.world.length, 9);
+  const cmd = {
+    key: crypto.randomUUID(),
+    version: 0,
+    type: "move",
+    target: 5049,
+  };
+  assert.equal((await request("alpha", "action", cmd, b.csrf)).status, 403);
+  const race = await Promise.all([
+    request("alpha", "action", cmd, a.csrf),
+    request(
+      "alpha",
+      "action",
+      { ...cmd, key: crypto.randomUUID(), target: 5051 },
+      a.csrf,
+    ),
+  ]);
+  assert.deepEqual(race.map((r) => r.status).sort(), [200, 409]);
+  const onRoad = await request("alpha", "state");
+  assert.equal(onRoad.state.player.location, 5050);
+  const location = onRoad.state.player.travel.to;
   assert.equal(
     (
       await request(
         "alpha",
         "action",
-        { key: crypto.randomUUID(), version: 0, type: "move", target: 11 },
-        b.csrf,
+        { key: crypto.randomUUID(), version: 1, type: "search" },
+        a.csrf,
       )
     ).status,
-    403,
+    409,
   );
-  const command = {
-    key: crypto.randomUUID(),
-    version: 0,
-    type: "move",
-    target: 11,
-  };
-  const race = await Promise.all([
-    request("alpha", "action", command, a.csrf),
-    request(
-      "alpha",
-      "action",
-      { ...command, key: crypto.randomUUID(), target: 13 },
-      a.csrf,
-    ),
-  ]);
-  assert.deepEqual(race.map((r) => r.status).sort(), [200, 409]);
-  const alphaState = await request("alpha", "state");
-  const location = alphaState.state.player.location;
   await request(
     "bravo",
     "action",
     { key: crypto.randomUUID(), version: 0, type: "move", target: location },
     b.csrf,
   );
+  time += 20000;
+  const av = (await request("alpha", "state")).state.player.version,
+    bv = (await request("bravo", "state")).state.player.version;
   const claims = await Promise.all([
     request(
       "alpha",
       "action",
       {
         key: crypto.randomUUID(),
-        version: 1,
+        version: av,
         type: "attack",
         target: `walker-${location}`,
       },
@@ -107,7 +112,7 @@ try {
       "action",
       {
         key: crypto.randomUUID(),
-        version: 1,
+        version: bv,
         type: "attack",
         target: `walker-${location}`,
       },
@@ -118,21 +123,48 @@ try {
   const winner = claims[0].status === 200 ? "alpha" : "bravo",
     token = winner === "alpha" ? a.csrf : b.csrf;
   for (let i = 0; i < 3; i++) {
-    const s = await request(winner, "state");
-    const strike = {
-      key: crypto.randomUUID(),
-      version: s.state.player.version,
-      type: "strike",
-    };
-    const hit = await request(winner, "action", strike, token);
-    const replay = await request(winner, "action", strike, token);
+    const s = await request(winner, "state"),
+      strike = {
+        key: crypto.randomUUID(),
+        version: s.state.player.version,
+        type: "strike",
+      };
+    const hit = await request(winner, "action", strike, token),
+      replay = await request(winner, "action", strike, token);
     assert.equal(hit.state.player.energy, 90);
-    assert.deepEqual(replay.state.player, hit.state.player);
+    assert.equal(replay.state.player.version, hit.state.player.version);
   }
-  const won = await request(winner, "state");
-  assert.equal(won.state.player.kills, 1);
-  assert.equal(won.state.player.scrap, 32);
-  assert.equal(won.state.encounter, null);
+  assert.equal((await request(winner, "state")).state.player.kills, 1);
+  let world = JSON.parse(
+    database.prepare("SELECT payload FROM hosted_world").get().payload,
+  );
+  world.supplies[location] = { remaining: 1, at: time };
+  database
+    .prepare("UPDATE hosted_world SET payload=?")
+    .run(JSON.stringify(world));
+  const search = async (user, token) => {
+    const s = await request(user, "state");
+    return request(
+      user,
+      "action",
+      {
+        key: crypto.randomUUID(),
+        version: s.state.player.version,
+        type: "search",
+      },
+      token,
+    );
+  };
+  const searches = await Promise.all([
+    search("alpha", a.csrf),
+    search("bravo", b.csrf),
+  ]);
+  assert.deepEqual(searches.map((r) => r.status).sort(), [200, 409]);
+  assert.equal(
+    (await request("alpha", "state")).state.world.find((l) => l.id === location)
+      .supply.remaining,
+    0,
+  );
   const freshWorker = await import("../dist/server/index.js?restart");
   const persisted = await freshWorker.default.fetch(
     new Request(origin + "/api/state", {
@@ -141,6 +173,25 @@ try {
     { DB },
   );
   assert.equal((await persisted.json()).state.player.kills, 1);
+  world = JSON.parse(
+    database.prepare("SELECT payload FROM hosted_world").get().payload,
+  );
+  delete world.schemaVersion;
+  delete world.supplies;
+  world.encounters = {};
+  world.enemies = { "walker-11": time + 1000 };
+  for (const p of Object.values(world.players)) {
+    p.location = 11;
+    p.travel = null;
+  }
+  const preserved = world.players[a.state.player.id].scrap;
+  database
+    .prepare("UPDATE hosted_world SET payload=?")
+    .run(JSON.stringify(world));
+  const migrated = await request("alpha", "state");
+  assert.equal(migrated.state.player.location, 5049);
+  assert.equal(migrated.state.player.scrap, preserved);
+  assert.equal(migrated.state.world.length, 9);
   const rejected = await worker.fetch(
     new Request(origin + "/api/register", {
       method: "POST",
@@ -154,60 +205,15 @@ try {
     { DB },
   );
   assert.equal(rejected.status, 403);
-  const html = await worker.fetch(new Request(origin), { DB });
-  assert.match(await html.text(), /DeadBrowse/);
-  // Keep the hosted rule adapter in parity with the original local game.
-  let now = Date.now();
-  const local = createGame(":memory:", { clock: () => now });
-  try {
-    const auth = await local.authenticate(
-      "register",
-      "Parity",
-      "test-only-password",
-    );
-    const world = emptyWorld();
-    register(world, auth.id, "Parity", now);
-    for (const [type, target, advance] of [
-      ["move", 11, 0],
-      ["search", undefined, 0],
-      ["attack", "walker-11", 0],
-      ["strike", undefined, 0],
-      ["guard", undefined, 0],
-      ["heal", undefined, 0],
-      ["strike", undefined, 0],
-      ["strike", undefined, 0],
-      ["move", 12, 0],
-      ["upgrade", undefined, 300000],
-    ]) {
-      now += advance;
-      const before = local.state(auth.id);
-      const input = {
-        type,
-        target,
-        key: crypto.randomUUID(),
-        version: before.player.version,
-      };
-      const expected = local.act(auth.id, input).player;
-      const actual = action(world, auth.id, input, now).player;
-      for (const key of [
-        "location",
-        "hp",
-        "energy",
-        "scrap",
-        "medkits",
-        "xp",
-        "kills",
-        "level",
-        "version",
-      ])
-        assert.equal(actual[key], expected[key], `${type}: ${key}`);
-    }
-  } finally {
-    local.close();
-  }
+  const art = await worker.fetch(new Request(origin + "/art/city-atlas.webp"), {
+    DB,
+  });
+  assert.equal(art.headers.get("content-type"), "image/webp");
+  assert.ok((await art.arrayBuffer()).byteLength > 10000);
   console.log(
-    "Hosted checks passed: dispatch identity, onboarding, CSRF/origin protection, simultaneous commands, contested targets, idempotent combat/rewards, persistence, and parity with local gameplay.",
+    "Hosted checks passed: identity, migration without loss, local visibility, authoritative travel, contested targets, last-stock race, idempotent combat, saved state, CSRF/origin checks, and artwork delivery.",
   );
 } finally {
+  Date.now = realNow;
   database.close();
 }

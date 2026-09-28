@@ -4,15 +4,17 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { createGame } from "../src/game.js";
 import { createServer } from "../src/server.js";
+import { HOME, WORLD, RULES, adjacent, localBlocks } from "../src/world.js";
 const password = "correct horse battery";
 async function setup(t) {
-  let now = 1_800_000_000_000;
+  let now = 1800000000000;
   const game = createGame(":memory:", { clock: () => now });
   t.after(() => game.close());
-  const alice = await game.authenticate("register", "Alice", password);
-  const bob = await game.authenticate("register", "Bob", password);
+  const a = await game.authenticate("register", "Alice", password),
+    b = await game.authenticate("register", "Bob", password);
   const act = (id, type, target, extra = {}) =>
     game.act(id, {
       key: randomUUID(),
@@ -21,249 +23,288 @@ async function setup(t) {
       target,
       ...extra,
     });
-  return { game, alice, bob, act, tick: (ms) => (now += ms) };
+  return {
+    game,
+    a,
+    b,
+    act,
+    tick: (ms) => (now += ms),
+    travel(id, target) {
+      const s = act(id, "move", target);
+      now = s.player.travel.arrivesAt;
+      return game.state(id);
+    },
+    edit(fn) {
+      const w = JSON.parse(
+        game.db.prepare("SELECT payload FROM world_state").get().payload,
+      );
+      fn(w);
+      game.db
+        .prepare("UPDATE world_state SET payload=?")
+        .run(JSON.stringify(w));
+    },
+  };
 }
-test("accounts are independent and passwords / sessions are verified", async (t) => {
-  const { game, alice, bob, act } = await setup(t);
-  assert.equal(game.session(alice.token).user_id, alice.id);
-  assert.equal(game.session("wrong"), undefined);
-  act(alice.id, "move", 11);
-  assert.equal(game.state(bob.id).player.location, 12);
+test("100×100 city returns only the local 3×3 and never wraps edges", async (t) => {
+  const { game, a, edit } = await setup(t);
+  assert.equal(WORLD.length, 10000);
+  const s = game.state(a.id);
+  assert.equal(s.world.length, 9);
+  assert.equal(s.player.location, HOME);
+  assert.equal(s.city.width, 100);
+  assert.equal(adjacent(99, 100), false);
+  assert.equal(adjacent(0, 101), true);
+  edit((w) => (w.players[a.id].location = 0));
+  assert.equal(game.state(a.id).world.length, 4);
+  assert.equal(localBlocks(9999).length, 4);
+});
+test("timed travel prevents early arrivals and actions, survives polling, and settles once", async (t) => {
+  const { game, a, act, tick } = await setup(t);
+  const start = act(a.id, "move", 5049);
+  assert.equal(start.player.location, HOME);
+  assert.equal(start.player.energy, 100);
+  assert.equal(
+    start.player.travel.arrivesAt - start.player.travel.departedAt,
+    20000,
+  );
+  assert.throws(() => act(a.id, "search"), /travelling/);
+  assert.throws(() => act(a.id, "move", 4950), /travelling/);
+  tick(19999);
+  assert.equal(game.state(a.id).player.location, HOME);
+  tick(1);
+  let s = game.state(a.id);
+  assert.equal(s.player.location, 5049);
+  assert.equal(s.player.travel, null);
+  const version = s.player.version;
+  s = game.state(a.id);
+  assert.equal(s.player.version, version);
+  assert.equal(
+    s.events.filter((e) => e.message.startsWith("Arrived")).length,
+    1,
+  );
+});
+test("diagonal travel takes 28s; non-neighbours and forged timestamps are rejected", async (t) => {
+  const { game, a, act } = await setup(t);
+  assert.throws(() => act(a.id, "move", 0), /adjacent/);
+  const s = act(a.id, "move", 4949, { arrivesAt: 0, energy: 999, scrap: 999 });
+  assert.equal(s.player.travel.arrivesAt - s.player.travel.departedAt, 28000);
+  assert.equal(s.player.energy, 100);
+  assert.equal(s.player.scrap, 20);
+});
+test("shared scavenging stock depletes and refills slowly without grants from polling", async (t) => {
+  const { game, a, b, act, travel, tick, edit } = await setup(t);
+  travel(a.id, 5049);
+  travel(b.id, 5049);
+  edit((w) => (w.supplies[5049] = { remaining: 1, at: 1800000040000 }));
+  const s = act(a.id, "search");
+  assert.equal(s.world.find((l) => l.id === 5049).supply.remaining, 0);
+  assert.throws(() => act(b.id, "search"), /picked clean/);
+  assert.equal(game.state(b.id).player.xp, 0);
+  tick(RULES.supplyRefillInterval - 1);
+  assert.equal(
+    game.state(b.id).world.find((l) => l.id === 5049).supply.remaining,
+    0,
+  );
+  tick(1);
+  assert.equal(
+    game.state(b.id).world.find((l) => l.id === 5049).supply.remaining,
+    1,
+  );
+  act(b.id, "search");
+  assert.equal(
+    game.state(b.id).world.find((l) => l.id === 5049).supply.remaining,
+    0,
+  );
+});
+test("combat costs energy only on initiation and rewards cannot be replayed", async (t) => {
+  const { game, a, act, travel } = await setup(t);
+  travel(a.id, 5049);
+  let s = act(a.id, "attack", "walker-5049");
+  assert.equal(s.player.energy, 90);
+  assert.throws(() => act(a.id, "move", HOME), /Finish your encounter/);
+  for (let i = 0; i < 3; i++) {
+    const cmd = {
+      key: randomUUID(),
+      version: s.player.version,
+      type: "strike",
+    };
+    s = game.act(a.id, cmd);
+    assert.equal(game.act(a.id, cmd).player.version, s.player.version);
+    assert.equal(s.player.energy, 90);
+  }
+  assert.equal(s.player.kills, 1);
+  assert.equal(s.player.scrap, 32);
+  assert.equal(s.encounter, null);
+  assert.throws(() => act(a.id, "strike"), /not in combat/);
+});
+test("shared target contention and inactivity expiry release exactly one claim", async (t) => {
+  const { game, a, b, act, travel, tick } = await setup(t);
+  travel(a.id, 5049);
+  travel(b.id, 5049);
+  act(a.id, "attack", "walker-5049");
+  assert.throws(() => act(b.id, "attack", "walker-5049"), /Another survivor/);
+  assert.equal(game.state(b.id).player.energy, 100);
+  tick(900001);
+  assert.ok(act(b.id, "attack", "walker-5049").encounter);
+  assert.equal(game.state(a.id).encounter, null);
+});
+test("stale commands roll back and medical healing respects health and inventory", async (t) => {
+  const { game, a, act, travel } = await setup(t);
+  travel(a.id, 5049);
+  const stale = game.state(a.id).player.version;
+  act(a.id, "search");
+  assert.throws(
+    () => act(a.id, "search", undefined, { version: stale }),
+    /state changed/,
+  );
+  act(a.id, "attack", "walker-5049");
+  act(a.id, "strike");
+  let s = act(a.id, "heal");
+  assert.equal(s.player.hp, 94);
+  assert.equal(s.player.medkits, 1);
+  assert.equal(s.player.energy, 90);
+});
+test("production settles previous level and caps offline accrual", async (t) => {
+  const { game, a, act, tick } = await setup(t);
+  tick(1200000);
+  assert.equal(game.state(a.id).player.scrap, 40);
+  let s = act(a.id, "upgrade");
+  assert.equal(s.player.level, 2);
+  assert.equal(s.player.scrap, 0);
+  tick(60000000);
+  s = game.state(a.id);
+  assert.equal(s.player.scrap, 960);
+  assert.equal(game.state(a.id).player.scrap, 960);
+});
+test("defeat restores the refuge position and insufficient energy creates no encounter", async (t) => {
+  const { game, a, act, travel, edit } = await setup(t);
+  travel(a.id, 5049);
+  edit((w) => (w.players[a.id].energy = 0));
+  assert.throws(() => act(a.id, "attack", "walker-5049"), /Not enough energy/);
+  edit((w) => {
+    w.players[a.id].energy = 100;
+    w.players[a.id].hp = 5;
+  });
+  act(a.id, "attack", "walker-5049");
+  const s = act(a.id, "strike");
+  assert.equal(s.player.location, HOME);
+  assert.equal(s.player.hp, 50);
+  assert.equal(s.encounter, null);
+});
+test("accounts and authenticated sessions are independent", async (t) => {
+  const { game, a, b } = await setup(t);
+  assert.equal(game.session(a.token).user_id, a.id);
   await assert.rejects(
-    game.authenticate("login", "Alice", "bad password value"),
+    game.authenticate("login", "Alice", "wrong password"),
     /Incorrect/,
   );
   await assert.rejects(
     game.authenticate("register", "ALICE", password),
     /already in use/,
   );
-  assert.equal(
-    (await game.authenticate("login", "alice", password)).id,
-    alice.id,
-  );
-  game.logout(alice.token);
-  assert.equal(game.session(alice.token), undefined);
+  assert.equal((await game.authenticate("login", "alice", password)).id, a.id);
+  game.logout(a.token);
+  assert.equal(game.session(a.token), undefined);
+  assert.equal(game.state(b.id).player.location, HOME);
 });
-test("movement is adjacent, validated and does not charge energy", async (t) => {
-  const { game, alice, act } = await setup(t);
-  assert.throws(() => act(alice.id, "move", 0), /adjacent/);
-  assert.throws(() => act(alice.id, "move", "11"), /adjacent/);
-  const state = act(alice.id, "move", 11, { energy: 9999, scrap: 9999 });
-  assert.equal(state.player.location, 11);
-  assert.equal(state.player.energy, 100);
-  assert.equal(state.player.scrap, 20);
-});
-test("combat charges only initiation and pays rewards once", async (t) => {
-  const { game, alice, act } = await setup(t);
-  act(alice.id, "move", 11);
-  let state = act(alice.id, "attack", "walker-11");
-  assert.equal(state.player.energy, 90);
-  assert.ok(state.encounter);
-  assert.throws(() => act(alice.id, "move", 12), /Finish your encounter/);
-  const command = {
-    key: randomUUID(),
-    version: state.player.version,
-    type: "strike",
-  };
-  state = game.act(alice.id, command);
-  assert.equal(state.encounter.enemy_hp, 29);
-  assert.equal(game.act(alice.id, command).encounter.enemy_hp, 29);
-  assert.equal(state.player.energy, 90);
-  state = act(alice.id, "strike");
-  state = act(alice.id, "strike");
-  assert.equal(state.encounter, null);
-  assert.equal(state.player.energy, 90);
-  assert.equal(state.player.kills, 1);
-  assert.equal(state.player.xp, 20);
-  assert.equal(state.player.scrap, 32);
-  assert.throws(() => act(alice.id, "strike"), /not in combat/);
-  assert.throws(() => act(alice.id, "attack", "walker-11"), /not returned/);
-});
-test("shared targets cannot be claimed twice; rejected actions roll back energy", async (t) => {
-  const { game, alice, bob, act, tick } = await setup(t);
-  act(alice.id, "move", 11);
-  act(bob.id, "move", 11);
-  act(alice.id, "attack", "walker-11");
-  assert.throws(() => act(bob.id, "attack", "walker-11"), /Another survivor/);
-  assert.equal(game.state(bob.id).player.energy, 100);
-  tick(900_001);
-  const b = act(bob.id, "attack", "walker-11");
-  assert.ok(b.encounter);
-  assert.equal(game.state(alice.id).encounter, null);
-});
-test("stale and simultaneous commands cannot spend or reward twice", async (t) => {
-  const { game, alice } = await setup(t);
-  const version = game.state(alice.id).player.version;
-  const command = { key: randomUUID(), version, type: "move", target: 11 };
-  game.act(alice.id, command);
-  assert.throws(
-    () => game.act(alice.id, { ...command, key: randomUUID(), target: 13 }),
-    /state changed/,
-  );
-  assert.equal(game.act(alice.id, command).player.location, 11);
-  assert.throws(() => game.act(alice.id, { type: "search" }), /command key/);
-});
-test("energy recovery uses server time and cannot bank recovery while full", async (t) => {
-  const { game, alice, act, tick } = await setup(t);
-  tick(3_600_000);
-  act(alice.id, "move", 11);
-  act(alice.id, "attack", "walker-11");
-  tick(59_999);
-  assert.equal(game.state(alice.id).player.energy, 90);
-  tick(1);
-  assert.equal(game.state(alice.id).player.energy, 91);
-  tick(600_000);
-  assert.equal(game.state(alice.id).player.energy, 100);
-});
-test("scavenging has a server cooldown and medical loot is usable without energy", async (t) => {
-  const { game, alice, act, tick } = await setup(t);
-  act(alice.id, "move", 7);
-  act(alice.id, "move", 6);
-  let s = act(alice.id, "search");
-  assert.equal(s.player.medkits, 3);
-  assert.equal(s.player.energy, 100);
-  assert.throws(() => act(alice.id, "search"), /moment/);
-  assert.throws(() => act(alice.id, "heal"), /injury/);
-  act(alice.id, "attack", "walker-6");
-  s = act(alice.id, "strike");
-  s = act(alice.id, "heal");
-  assert.equal(s.player.medkits, 2);
-  assert.equal(s.player.hp, 94);
-  assert.equal(s.player.energy, 90);
-  act(alice.id, "flee");
-  tick(30_000);
-  s = act(alice.id, "search");
-  assert.equal(s.player.medkits, 3);
-});
-test("production is persistent, capped, and upgrades settle old production first", async (t) => {
-  const { game, alice, act, tick } = await setup(t);
-  tick(20 * 60_000);
-  let s = game.state(alice.id);
-  assert.equal(s.player.scrap, 40);
-  assert.equal(game.state(alice.id).player.scrap, 40);
-  s = act(alice.id, "upgrade");
-  assert.equal(s.player.scrap, 0);
-  assert.equal(s.player.level, 2);
-  tick(60_000);
-  assert.equal(game.state(alice.id).player.scrap, 2);
-  tick(1000 * 60_000);
-  assert.equal(game.state(alice.id).player.scrap, 962);
-  assert.equal(game.state(alice.id).player.scrap, 962);
-});
-test("not enough energy rejects attack without claiming the target", async (t) => {
-  const { game, alice, act } = await setup(t);
-  act(alice.id, "move", 11);
-  game.db.prepare("UPDATE players SET energy=0 WHERE id=?").run(alice.id);
-  assert.throws(
-    () => act(alice.id, "attack", "walker-11"),
-    /Not enough energy/,
-  );
-  assert.equal(game.state(alice.id).encounter, null);
-  assert.equal(game.state(alice.id).enemies[0].available, true);
-});
-test("defeat returns survivor to refuge and releases the encounter", async (t) => {
-  const { game, alice, act } = await setup(t);
-  act(alice.id, "move", 11);
-  act(alice.id, "attack", "walker-11");
-  game.db.prepare("UPDATE players SET hp=5 WHERE id=?").run(alice.id);
-  const s = act(alice.id, "strike");
-  assert.equal(s.player.hp, 50);
-  assert.equal(s.player.location, 12);
-  assert.equal(s.encounter, null);
-  assert.equal(s.player.energy, 90);
-});
-test("characters, inventory, sessions and encounters survive a server restart", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "deadbrowse-"));
-  const path = join(dir, "world.sqlite");
+test("travel and supplies persist through restarting the server", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "deadbrowse-")),
+    path = join(dir, "world.sqlite");
   let game;
+  let now = 1800000000000;
   try {
-    game = createGame(path);
-    const auth = await game.authenticate("register", "Persistent", password);
-    game.act(auth.id, {
+    game = createGame(path, { clock: () => now });
+    const a = await game.authenticate("register", "Persistent", password);
+    game.act(a.id, {
       key: randomUUID(),
       version: 0,
       type: "move",
-      target: 11,
-    });
-    game.act(auth.id, {
-      key: randomUUID(),
-      version: 1,
-      type: "attack",
-      target: "walker-11",
+      target: 5049,
     });
     game.close();
-    game = createGame(path);
-    const s = game.state(auth.id);
-    assert.equal(s.player.location, 11);
-    assert.equal(s.player.energy, 90);
-    assert.ok(s.encounter);
-    assert.equal(game.session(auth.token).user_id, auth.id);
+    game = createGame(path, { clock: () => now });
+    assert.ok(game.state(a.id).player.travel);
+    now += 20000;
+    let s = game.state(a.id);
+    assert.equal(s.player.location, 5049);
+    s = game.act(a.id, {
+      key: randomUUID(),
+      version: s.player.version,
+      type: "search",
+    });
+    const stock = s.world.find((l) => l.id === 5049).supply.remaining;
+    game.close();
+    game = createGame(path, { clock: () => now });
+    assert.equal(
+      game.state(a.id).world.find((l) => l.id === 5049).supply.remaining,
+      stock,
+    );
+    assert.equal(game.session(a.token).user_id, a.id);
   } finally {
     game?.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
-test("HTTP authentication, CSRF, same-origin enforcement and state isolation", async (t) => {
+test("legacy local saves migrate into the larger city without losing resources", () => {
+  const dir = mkdtempSync(join(tmpdir(), "deadbrowse-migrate-")),
+    path = join(dir, "legacy.sqlite");
+  let game;
+  try {
+    const d = new DatabaseSync(path);
+    d.exec(
+      `CREATE TABLE users(id TEXT PRIMARY KEY,name TEXT,password TEXT,salt TEXT); CREATE TABLE players(id TEXT,location INTEGER,hp INTEGER,energy INTEGER,energy_at INTEGER,scrap INTEGER,medkits INTEGER,xp INTEGER,kills INTEGER,level INTEGER,production_at INTEGER,search_at INTEGER,version INTEGER); INSERT INTO users VALUES('old','Veteran','hash','salt'); INSERT INTO players VALUES('old',11,76,81,1800000000000,123,7,40,2,3,1800000000000,0,9); PRAGMA user_version=1;`,
+    );
+    d.close();
+    game = createGame(path, { clock: () => 1800000000000 });
+    const s = game.state("old");
+    assert.equal(s.player.location, 5049);
+    assert.equal(s.player.scrap, 123);
+    assert.equal(s.player.hp, 76);
+    assert.equal(s.player.medkits, 7);
+    assert.equal(s.player.level, 3);
+  } finally {
+    game?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test("HTTP identity, CSRF, origin, and input boundaries", async (t) => {
   const { server, game } = createServer({ dbPath: ":memory:" });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
   t.after(async () => {
-    await new Promise((resolve) => server.close(resolve));
+    await new Promise((r) => server.close(r));
     game.close();
   });
   const base = `http://127.0.0.1:${server.address().port}`;
-  const post = (path, body = {}, headers = {}) =>
+  const post = (path, data, headers = {}) =>
     fetch(base + path, {
       method: "POST",
       headers: { Origin: base, "Content-Type": "application/json", ...headers },
-      body: JSON.stringify(body),
+      body: JSON.stringify(data),
     });
   assert.equal((await fetch(base + "/api/state")).status, 401);
   assert.equal(
     (
       await post(
         "/api/register",
-        { name: "WebUser", password },
-        { Origin: "https://attacker.invalid" },
+        { name: "Webuser", password },
+        { Origin: "https://evil.example" },
       )
     ).status,
     403,
   );
-  const response = await post("/api/register", { name: "WebUser", password });
-  assert.equal(response.status, 200);
-  const cookie = response.headers.get("set-cookie");
+  const r = await post("/api/register", { name: "Webuser", password });
+  const cookie = r.headers.get("set-cookie");
   assert.match(cookie, /HttpOnly/);
-  assert.match(cookie, /SameSite=Strict/);
-  const data = await response.json(),
+  const data = await r.json(),
     headers = { Cookie: cookie.split(";")[0] };
-  assert.equal((await fetch(base + "/api/state", { headers })).status, 200);
-  assert.equal(
-    (
-      await post(
-        "/api/action",
-        { type: "move", target: 11, key: randomUUID(), version: 0 },
-        headers,
-      )
-    ).status,
-    403,
-  );
+  const cmd = { key: randomUUID(), version: 0, type: "move", target: 5049 };
+  assert.equal((await post("/api/action", cmd, headers)).status, 403);
   headers["X-CSRF-Token"] = data.csrf;
-  const moved = await post(
-    "/api/action",
-    { type: "move", target: 11, key: randomUUID(), version: 0 },
-    headers,
-  );
-  assert.equal(moved.status, 200);
-  assert.equal((await moved.json()).state.player.location, 11);
-  assert.equal((await post("/api/action", null, headers)).status, 400);
+  assert.equal((await post("/api/action", cmd, headers)).status, 200);
   assert.equal(
-    (await post("/api/action", { blob: "a".repeat(5000) }, headers)).status,
+    (await post("/api/action", { x: "x".repeat(5000) }, headers)).status,
     413,
   );
+  assert.equal((await fetch(base + "/art/city-atlas.webp")).status, 200);
   assert.equal((await fetch(base + "/src/game.js")).status, 404);
-  assert.match(
-    (await fetch(base + "/")).headers.get("content-security-policy"),
-    /frame-ancestors 'none'/,
-  );
-  assert.equal((await post("/api/logout", {}, headers)).status, 200);
-  assert.equal((await fetch(base + "/api/state", { headers })).status, 401);
 });

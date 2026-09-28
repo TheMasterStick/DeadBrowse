@@ -1,6 +1,12 @@
 export class ConflictError extends Error {}
 export function emptyWorld() {
-  return { players: {}, encounters: {}, enemies: {} };
+  return {
+    schemaVersion: 2,
+    players: {},
+    encounters: {},
+    enemies: {},
+    supplies: {},
+  };
 }
 export async function transact(db, operation) {
   await db

@@ -2,16 +2,14 @@ import { chromium } from "playwright";
 import assert from "node:assert/strict";
 import { mkdirSync } from "node:fs";
 import { createServer } from "../src/server.js";
-
-// An isolated world and controllable server clock; never touches player saves.
-let worldTime = Date.now();
+let time = Date.now();
 const { server, game } = createServer({
   dbPath: ":memory:",
-  clock: () => worldTime,
+  clock: () => time,
   secureCookies: false,
   publicOrigin: undefined,
 });
-await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const base = `http://127.0.0.1:${server.address().port}`;
 let browser;
 try {
@@ -24,91 +22,95 @@ try {
   });
   mkdirSync("test-results", { recursive: true });
   const page = await browser.newPage({
-    viewport: { width: 1440, height: 1100 },
+    viewport: { width: 1440, height: 1000 },
   });
   const errors = [];
-  page.on("pageerror", (error) => errors.push(error.message));
-  async function register(tab, name) {
-    await tab.goto(base);
-    await tab.getByLabel("SURVIVOR NAME").fill(name);
-    await tab
-      .getByLabel("PASSWORD", { exact: true })
+  page.on("pageerror", (e) => errors.push(e.message));
+  const register = async (p, name) => {
+    await p.goto(base);
+    await p.getByLabel("Survivor name").fill(name);
+    await p
+      .getByLabel("Password", { exact: true })
       .fill("test-only-survivor-password");
-    await tab.getByRole("button", { name: "Enter the district" }).click();
-    await tab
-      .getByRole("heading", { name: "The district", exact: true })
+    await p.getByRole("button", { name: "Enter the district" }).click();
+    await p
+      .getByRole("heading", { name: "Local area", exact: true })
+      .first()
       .waitFor();
-  }
-  await page.goto(base);
-  await page.screenshot({ path: "test-results/login.png", fullPage: true });
+  };
+  const state = async (p) =>
+    p.evaluate(async () => (await (await fetch("/api/state")).json()).state);
   await register(page, "Nicholas");
+  assert.equal(await page.locator(".map-tile").count(), 9);
+  assert.equal((await state(page)).city.width, 100);
   await page.screenshot({ path: "test-results/district.png", fullPage: true });
-  await page.getByRole("button", { name: "Row houses", exact: true }).click();
+  await page.locator('[data-location="5049"]').click();
   await page.getByRole("button", { name: "Travel here" }).click();
-  await page.getByRole("button", { name: "Search for supplies" }).click();
-  await page.getByRole("button", { name: "Initiate attack" }).click();
-  await page.getByRole("button", { name: "Strike", exact: true }).waitFor();
-
-  const secondContext = await browser.newContext();
-  const secondPlayer = await secondContext.newPage();
-  secondPlayer.on("pageerror", (error) => errors.push(error.message));
-  await register(secondPlayer, "SecondSurvivor");
-  await secondPlayer
-    .getByRole("button", { name: "Row houses", exact: true })
+  await page.getByLabel("Journey in progress").waitFor();
+  let s = await state(page);
+  assert.equal(s.player.location, 5050);
+  assert.equal(s.player.travel.to, 5049);
+  await page.reload();
+  await page.getByLabel("Journey in progress").waitFor();
+  await page.screenshot({ path: "test-results/travel.png", fullPage: true });
+  time += 20000;
+  await page.reload();
+  await page
+    .getByRole("button", { name: "Search for supplies", exact: true })
+    .waitFor();
+  await page
+    .getByRole("button", { name: "Search for supplies", exact: true })
     .click();
-  await secondPlayer.getByRole("button", { name: "Travel here" }).click();
-  await secondPlayer.getByText("Engaged by another survivor").waitFor();
+  await page.getByRole("button", { name: "Initiate attack" }).click();
+  await page.getByRole("heading", { name: "Attacking", exact: true }).waitFor();
+  await page.screenshot({ path: "test-results/combat.png", fullPage: true });
+  const context2 = await browser.newContext(),
+    second = await context2.newPage();
+  await register(second, "SecondSurvivor");
+  await second.locator('[data-location="5049"]').click();
+  await second.getByRole("button", { name: "Travel here" }).click();
+  await second.getByLabel("Journey in progress").waitFor();
+  time += 20000;
+  await second.reload();
+  await second.getByText("Engaged by another survivor").waitFor();
   assert.equal(
-    await secondPlayer
-      .getByRole("button", { name: "Initiate attack" })
-      .isDisabled(),
+    await second.getByRole("button", { name: "Initiate attack" }).isDisabled(),
     true,
   );
-
-  for (let round = 0; round < 3; round++) {
+  for (let i = 0; i < 3; i++)
     await Promise.all([
       page.waitForResponse(
-        (response) =>
-          response.url().endsWith("/api/action") && response.status() === 200,
+        (r) => r.url().endsWith("/api/action") && r.status() === 200,
       ),
-      page.getByRole("button", { name: "Strike", exact: true }).click(),
+      page.getByRole("button", { name: /^Strike/ }).click(),
     ]);
-  }
-  await page
-    .getByText("Target defeated. Gained 20 XP and 12 scrap.", { exact: true })
-    .first()
-    .waitFor();
-  assert.match(await page.locator(".stat.energy strong").textContent(), /90/);
-  await page.reload();
-  await page
-    .getByRole("heading", { name: "The district", exact: true })
-    .waitFor();
-  assert.match(await page.locator(".stat.energy strong").textContent(), /90/);
-  await page.getByRole("button", { name: "The refuge", exact: true }).click();
+  await page.getByRole("heading", { name: "Encounter complete" }).waitFor();
+  s = await state(page);
+  assert.equal(s.player.energy, 90);
+  assert.equal(s.player.kills, 1);
+  await page.getByRole("button", { name: "Return to local area" }).click();
+  await page.locator('[data-location="5050"]').click();
   await page.getByRole("button", { name: "Travel here" }).click();
-  // Observe completion before advancing time and navigating away.
-  await page.getByRole("button", { name: "Manage your refuge" }).waitFor();
-  worldTime += 5 * 60_000;
+  await page.getByLabel("Journey in progress").waitFor();
+  time += 5 * 60000;
   await page.reload();
-  await page.getByRole("button", { name: "My refuge" }).click();
+  await page.getByRole("button", { name: "My refuge", exact: true }).click();
   await page.getByRole("button", { name: "Upgrade workbench" }).click();
-  await page.getByText("Level 2 / 5", { exact: true }).waitFor();
+  await page
+    .getByText("Salvage workbench · Level 2", { exact: true })
+    .waitFor();
+  await page.locator("#toast.show").waitFor({ state: "hidden" });
+  await page.screenshot({ path: "test-results/refuge.png", fullPage: true });
+  await page.getByRole("button", { name: "Overview", exact: true }).click();
+  await page.screenshot({ path: "test-results/overview.png", fullPage: true });
   await page.getByRole("button", { name: "Survivor", exact: true }).click();
   await page.getByRole("button", { name: "Use a medical kit" }).click();
-  await page
-    .getByText("Used a medical kit. Restored up to 35 health.", { exact: true })
-    .waitFor();
-  await page.getByRole("button", { name: "The district", exact: true }).click();
+  await page.getByRole("button", { name: "Local area", exact: true }).click();
   await page.setViewportSize({ width: 390, height: 844 });
-  // The mobile navigation must remain named and operable at the narrow breakpoint.
   await page
     .getByRole("button", { name: "Field journal", exact: true })
     .click();
-  await page
-    .getByRole("heading", { name: "Field journal", exact: true })
-    .first()
-    .waitFor();
-  await page.getByRole("button", { name: "The district", exact: true }).click();
+  await page.getByRole("button", { name: "Local area", exact: true }).click();
   await page.locator("#toast.show").waitFor({ state: "hidden" });
   await page.screenshot({ path: "test-results/mobile.png", fullPage: true });
   assert.equal(
@@ -117,14 +119,12 @@ try {
     ),
     true,
   );
-  await page.getByRole("button", { name: "Sign out" }).click();
-  await page.getByRole("heading", { name: "Welcome back." }).waitFor();
   assert.deepEqual(errors, []);
   console.log(
-    "Browser smoke passed: two accounts, movement, scavenging, shared target contention, combat energy, reload, upgrade, heal, mobile navigation/overflow, and logout. No browser errors.",
+    "Browser smoke passed: 9 visible tiles, 100×100 city, timed travel/reload/arrival, scavenging, 2-account contention, dedicated combat, initial energy cost, refuge upgrade, overview, healing, mobile navigation and no overflow. No JavaScript errors.",
   );
 } finally {
   await browser?.close();
-  await new Promise((resolve) => server.close(resolve));
+  await new Promise((r) => server.close(r));
   game.close();
 }

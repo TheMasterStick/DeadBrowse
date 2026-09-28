@@ -47,6 +47,7 @@ export function createServer({
           "/": ["index.html", "text/html"],
           "/app.js": ["app.js", "text/javascript"],
           "/styles.css": ["styles.css", "text/css"],
+          "/art/city-atlas.webp": ["art/city-atlas.webp", "image/webp"],
         };
         if (!files[path]) throw new GameError("Not found.", 404);
         const [file, mime] = files[path];

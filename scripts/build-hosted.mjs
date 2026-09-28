@@ -12,6 +12,7 @@ await build({
   platform: "browser",
   target: "es2022",
   minify: true,
+  loader: { ".webp": "binary" },
   plugins: [
     {
       name: "game-assets",
